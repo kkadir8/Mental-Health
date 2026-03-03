@@ -5,7 +5,8 @@ Connects Dashboard, Journal, AI Lab, Breathing Exercise, and About panels.
 
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QStackedWidget, QFrame,
-                             QSizePolicy, QApplication)
+                             QSizePolicy, QApplication, QLineEdit, QDialog,
+                             QDialogButtonBox, QMessageBox)
 from PyQt6.QtCore import Qt, QSize, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QFont, QIcon
 
@@ -14,6 +15,7 @@ from ui.assistant_ui import DashboardPanel, JournalPanel
 from ui.ai_lab import AILabWidget
 from ui.breathing_widget import BreathingWidget
 from ui.about_widget import AboutWidget
+from llm_service import get_llm_service
 
 from data_pipeline import DataPipeline
 from model_factory import ModelFactory
@@ -181,6 +183,35 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
+        # Gemini AI status & settings
+        self.llm_service = get_llm_service()
+
+        self.llm_status = QLabel()
+        self._update_llm_status()
+        self.llm_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.llm_status)
+
+        settings_btn = QPushButton("⚙️  Gemini API Key")
+        settings_btn.setFixedHeight(36)
+        settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        settings_btn.setStyleSheet(f"""
+            QPushButton {{
+                font-size: 12px;
+                color: {COLORS['text_secondary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                margin: 4px 12px;
+                padding: 4px;
+                background: transparent;
+            }}
+            QPushButton:hover {{
+                background: {COLORS['bg_secondary']};
+                color: {COLORS['text_primary']};
+            }}
+        """)
+        settings_btn.clicked.connect(self._show_api_key_dialog)
+        layout.addWidget(settings_btn)
+
         # Version label at bottom
         version = QLabel("v2.0.0")
         version.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 10px;")
@@ -220,6 +251,129 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.status_label)
 
         return header
+
+    def _update_llm_status(self):
+        """Update LLM status indicator in sidebar."""
+        if self.llm_service.is_available:
+            self.llm_status.setText("🟢 Gemini AI Active")
+            self.llm_status.setStyleSheet(f"color: {COLORS['success']}; font-size: 11px; padding: 4px;")
+            self.status_label.setText("● AI Ready")
+            self.status_label.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px;")
+        else:
+            self.llm_status.setText("⚪ Gemini AI Off")
+            self.llm_status.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; padding: 4px;")
+
+    def _show_api_key_dialog(self):
+        """Show dialog to configure Gemini API key."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Gemini API Key")
+        dialog.setFixedSize(480, 280)
+        dialog.setStyleSheet(f"background: {COLORS['bg_primary']}; color: {COLORS['text_primary']};")
+
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(12)
+        layout.setContentsMargins(24, 20, 24, 20)
+
+        # Title
+        title = QLabel("🤖 Google Gemini AI Configuration")
+        title.setStyleSheet(f"font-size: 16px; font-weight: bold; color: {COLORS['accent']};")
+        layout.addWidget(title)
+
+        # Instructions
+        info = QLabel(
+            "Gemini Flash is free (15 req/min, 1M tokens/day).\n"
+            "Get your API key from: https://aistudio.google.com/apikey"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet(f"font-size: 12px; color: {COLORS['text_secondary']};")
+        info.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        info.setOpenExternalLinks(True)
+        layout.addWidget(info)
+
+        # API key input
+        key_label = QLabel("API Key:")
+        key_label.setStyleSheet(f"font-size: 13px; color: {COLORS['text_primary']};")
+        layout.addWidget(key_label)
+
+        self.key_input = QLineEdit()
+        self.key_input.setPlaceholderText("Paste your Gemini API key here...")
+        self.key_input.setEchoMode(QLineEdit.EchoMode.Password)
+        if self.llm_service.api_key:
+            self.key_input.setText(self.llm_service.api_key)
+        self.key_input.setStyleSheet(f"""
+            QLineEdit {{
+                padding: 10px;
+                border: 1px solid {COLORS['border']};
+                border-radius: 8px;
+                background: {COLORS['bg_secondary']};
+                color: {COLORS['text_primary']};
+                font-size: 13px;
+            }}
+            QLineEdit:focus {{
+                border-color: {COLORS['accent']};
+            }}
+        """)
+        layout.addWidget(self.key_input)
+
+        # Buttons
+        btn_layout = QHBoxLayout()
+
+        remove_btn = QPushButton("Remove Key")
+        remove_btn.setStyleSheet(f"""
+            QPushButton {{
+                padding: 8px 16px; border-radius: 6px;
+                background: transparent; color: {COLORS['accent_orange']};
+                border: 1px solid {COLORS['accent_orange']};
+            }}
+            QPushButton:hover {{ background: rgba(243,156,18,0.1); }}
+        """)
+        remove_btn.clicked.connect(lambda: self._remove_api_key(dialog))
+        btn_layout.addWidget(remove_btn)
+
+        btn_layout.addStretch()
+
+        save_btn = QPushButton("Save & Connect")
+        save_btn.setStyleSheet(f"""
+            QPushButton {{
+                padding: 8px 20px; border-radius: 6px;
+                background: {COLORS['accent']}; color: white;
+                font-weight: bold; border: none;
+            }}
+            QPushButton:hover {{ background: #c0392b; }}
+        """)
+        save_btn.clicked.connect(lambda: self._save_api_key(dialog))
+        btn_layout.addWidget(save_btn)
+
+        layout.addLayout(btn_layout)
+        dialog.exec()
+
+    def _save_api_key(self, dialog: QDialog):
+        """Save and test the API key."""
+        key = self.key_input.text().strip()
+        if not key:
+            QMessageBox.warning(self, "Error", "Please enter an API key.")
+            return
+
+        success = self.llm_service.set_api_key(key)
+        if success:
+            self._update_llm_status()
+            QMessageBox.information(self, "Success",
+                                   "✅ Gemini AI connected successfully!\n"
+                                   "Journal responses will now be powered by AI.")
+            dialog.accept()
+        else:
+            QMessageBox.warning(self, "Failed",
+                                "❌ Could not connect to Gemini.\n"
+                                "Please check your API key and try again.")
+
+    def _remove_api_key(self, dialog: QDialog):
+        """Remove stored API key."""
+        self.llm_service.remove_api_key()
+        self.key_input.clear()
+        self._update_llm_status()
+        QMessageBox.information(self, "Removed",
+                                "API key removed. Template responses will be used.")
+        dialog.accept()
 
     def _make_nav_handler(self, index):
         """Create click handler for nav button at given index."""

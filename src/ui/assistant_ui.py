@@ -8,11 +8,12 @@ Dashboard: Mood trends, statistics cards, daily tips.
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                              QTextEdit, QPushButton, QListWidget, QMessageBox,
                              QFrame, QScrollArea, QSizePolicy, QListWidgetItem)
-from PyQt6.QtCore import Qt, QSize
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
 from ui.visualization_widget import PlotCanvas
 from ui.theme import COLORS, card_style, stat_card_style
 from response_engine import ResponseEngine, MOOD_MAP
+from llm_service import get_llm_service, LLMResponse
 
 try:
     from deep_translator import GoogleTranslator
@@ -199,6 +200,8 @@ class DashboardPanel(QWidget):
 # JOURNAL PANEL — Empathetic AI response instead of raw labels
 # ======================================================================
 class JournalPanel(QWidget):
+    llm_response_ready = pyqtSignal(object)  # Signal for thread-safe LLM callback
+
     def __init__(self, history, factory, pipeline):
         super().__init__()
         self.history = history
@@ -207,6 +210,9 @@ class JournalPanel(QWidget):
         self.class_names = None
         self.dashboard_ref = None
         self.response_engine = ResponseEngine()
+        self.llm_service = get_llm_service()
+        self.llm_response_ready.connect(self._on_llm_response)
+        self._pending_response = None  # Store template response while LLM loads
 
         if HAS_TRANSLATOR:
             self.translator = GoogleTranslator(source='auto', target='en')
@@ -294,6 +300,29 @@ class JournalPanel(QWidget):
         crisis_layout.addWidget(self.crisis_label)
         self.response_layout.addWidget(self.crisis_frame)
 
+        # LLM response area (Gemini)
+        self.llm_frame = QFrame()
+        self.llm_frame.setVisible(False)
+        self.llm_frame.setStyleSheet(f"""
+            QFrame {{
+                background: rgba(233, 69, 96, 0.06);
+                border-radius: 10px;
+                border-left: 3px solid {COLORS['accent']};
+                padding: 12px;
+            }}
+        """)
+        llm_inner = QVBoxLayout(self.llm_frame)
+        llm_inner.setContentsMargins(12, 8, 12, 8)
+        self.llm_header = QLabel("🤖 MindfulAI")
+        self.llm_header.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {COLORS['accent']};")
+        llm_inner.addWidget(self.llm_header)
+        self.llm_text = QLabel("")
+        self.llm_text.setWordWrap(True)
+        self.llm_text.setTextFormat(Qt.TextFormat.RichText)
+        self.llm_text.setStyleSheet(f"font-size: 13px; color: {COLORS['text_primary']}; line-height: 160%;")
+        llm_inner.addWidget(self.llm_text)
+        self.response_layout.addWidget(self.llm_frame)
+
         # Follow-up prompt
         self.followup_label = QLabel("")
         self.followup_label.setWordWrap(True)
@@ -375,9 +404,29 @@ class JournalPanel(QWidget):
         except Exception as e:
             print(f"Prediction error: {e}")
 
-        # Generate empathetic response
+        # Generate empathetic template response (instant)
         response = self.response_engine.generate_response(sentiment, confidence)
+        self._pending_response = response
         self._show_response(response)
+
+        # Try LLM for richer response (async, non-blocking)
+        if self.llm_service.is_available:
+            self.llm_frame.setVisible(True)
+            self.llm_header.setText("🤖 MindfulAI is thinking...")
+            self.llm_text.setText("")
+            self.btn_save.setEnabled(False)
+
+            severity = MOOD_MAP.get(sentiment, {}).get('severity', 1)
+            self.llm_service.generate_async(
+                category=sentiment,
+                confidence=confidence,
+                severity=severity,
+                original_text=text,
+                translated_text=translated_text,
+                callback=lambda resp: self.llm_response_ready.emit(resp)
+            )
+        else:
+            self.llm_frame.setVisible(False)
 
         # Save to history
         self.history.add_entry(text, sentiment, confidence)
@@ -407,6 +456,26 @@ class JournalPanel(QWidget):
             self.crisis_frame.setVisible(False)
 
         self.followup_label.setText(f"💭 Journal prompt: {response.followup_prompt}")
+
+    def _on_llm_response(self, llm_resp: LLMResponse):
+        """Handle async LLM response (called from signal, thread-safe)."""
+        self.btn_save.setEnabled(True)
+        if llm_resp.success:
+            self.llm_header.setText("🤖 MindfulAI (Gemini AI)")
+            # Convert newlines to HTML for proper display
+            html_text = llm_resp.text.replace('\n', '<br>')
+            self.llm_text.setText(html_text)
+            self.llm_frame.setVisible(True)
+            # Hide the template responses since we have a better LLM response
+            self.ack_label.setVisible(False)
+            self.support_label.setVisible(False)
+            self.followup_label.setVisible(False)
+        else:
+            # LLM failed, keep template response
+            self.llm_frame.setVisible(False)
+            self.ack_label.setVisible(True)
+            self.support_label.setVisible(True)
+            self.followup_label.setVisible(True)
 
     def refresh_list(self):
         self.history_list.clear()
