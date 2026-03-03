@@ -393,6 +393,11 @@ class JournalPanel(QWidget):
         try:
             clean_text = translated_text.lower()
             vec = self.pipeline.vectorizer.transform([clean_text])
+
+            # Auto-resolve class_names from pipeline if not set
+            if self.class_names is None and hasattr(self.pipeline, 'label_encoder') and hasattr(self.pipeline.label_encoder, 'classes_'):
+                self.class_names = self.pipeline.label_encoder.classes_
+
             if self.class_names is not None:
                 pred_idx = self.factory.predict(vec)[0]
                 sentiment = self.class_names[pred_idx]
@@ -471,8 +476,15 @@ class JournalPanel(QWidget):
             self.support_label.setVisible(False)
             self.followup_label.setVisible(False)
         else:
-            # LLM failed, keep template response
-            self.llm_frame.setVisible(False)
+            # LLM failed — show error info but keep template responses
+            error_msg = llm_resp.error or "Unknown error"
+            self.llm_header.setText("🤖 Gemini AI")
+            self.llm_text.setText(
+                f'<span style="color: #f39c12;">'
+                f'⚠️ Gemini could not respond: {error_msg}<br>'
+                f'Showing template response instead.</span>'
+            )
+            self.llm_frame.setVisible(True)
             self.ack_label.setVisible(True)
             self.support_label.setVisible(True)
             self.followup_label.setVisible(True)

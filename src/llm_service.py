@@ -145,7 +145,34 @@ class LLMService:
         try:
             import google.generativeai as genai
             genai.configure(api_key=self._api_key)
-            self._model = genai.GenerativeModel('gemini-2.0-flash')
+            # Safety settings: allow mental health discussion (our app's purpose)
+            self._safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+            # Try gemini-2.0-flash first, fallback to 1.5-flash
+            for model_name in ['gemini-2.0-flash', 'gemini-1.5-flash']:
+                try:
+                    self._model = genai.GenerativeModel(
+                        model_name,
+                        safety_settings=self._safety_settings
+                    )
+                    # Quick test to verify the key works
+                    self._model.generate_content(
+                        "Say OK",
+                        generation_config={'max_output_tokens': 5}
+                    )
+                    self._model_name = model_name
+                    print(f"[LLM] Connected to {model_name}")
+                    break
+                except Exception as model_err:
+                    print(f"[LLM] {model_name} failed: {model_err}")
+                    continue
+            else:
+                raise Exception("No Gemini model available")
+
             self._available = True
             self._save_config()
             return True
@@ -193,14 +220,35 @@ class LLMService:
                     'temperature': 0.8,
                     'top_p': 0.9,
                     'max_output_tokens': 500,
-                }
+                },
+                safety_settings=getattr(self, '_safety_settings', None)
             )
+
+            # Handle blocked responses (safety filter)
+            if hasattr(response, 'prompt_feedback'):
+                feedback = response.prompt_feedback
+                if hasattr(feedback, 'block_reason') and feedback.block_reason:
+                    return LLMResponse(
+                        text="", success=False, source="template",
+                        error=f"Content filtered ({feedback.block_reason}). Using template.")
+
+            # Check if candidates exist
+            if not response.candidates:
+                return LLMResponse(text="", success=False, source="template",
+                                   error="No response generated (possibly filtered)")
+
             text = response.text.strip()
             if text:
                 return LLMResponse(text=text, success=True, source="gemini")
             else:
                 return LLMResponse(text="", success=False, source="template",
                                    error="Empty response from Gemini")
+        except ValueError as e:
+            # Common when response is blocked
+            error_msg = str(e)
+            print(f"[LLM] Gemini blocked: {error_msg}")
+            return LLMResponse(text="", success=False, source="template",
+                               error="Response blocked by safety filter")
         except Exception as e:
             error_msg = str(e)
             print(f"[LLM] Gemini error: {error_msg}")

@@ -109,6 +109,9 @@ class MainWindow(QMainWindow):
         self.breathing = BreathingWidget()
         self.about = AboutWidget()
 
+        # Connect model training signal → Journal gets class names
+        self.ai_lab.bench_tab.model_ready.connect(self.journal_panel.set_class_names)
+
         self.pages.addWidget(self.dashboard_panel)  # 0
         self.pages.addWidget(self.journal_panel)      # 1
         self.pages.addWidget(self.ai_lab)              # 2
