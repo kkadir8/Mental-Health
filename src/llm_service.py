@@ -8,6 +8,7 @@ Falls back gracefully to template responses if API key is missing or quota excee
 
 import os
 import json
+import time
 import threading
 import urllib.request
 import urllib.error
@@ -92,12 +93,20 @@ class LLMResponse:
     error: Optional[str] = None
 
 
+# Validation result codes
+VALIDATION_OK = "ok"                  # Key valid, connected
+VALIDATION_QUOTA = "quota_exceeded"   # Key valid, but 429 quota exceeded
+VALIDATION_INVALID = "invalid_key"    # 401/403 — wrong key
+VALIDATION_ERROR = "error"            # Network or other problem
+
+
 def _gemini_request(api_key: str, model: str, prompt: str,
                     temperature: float = 0.8, max_tokens: int = 500,
                     timeout: int = 20) -> dict:
     """
     Make a direct REST API call to Gemini. No SDK needed.
     Returns the parsed JSON response dict.
+    Raises urllib.error.HTTPError on HTTP errors.
     """
     url = GEMINI_API_URL.format(model=model, key=api_key)
     payload = {
@@ -143,14 +152,17 @@ class LLMService:
     # ---- Config persistence ----
 
     def _load_config(self):
-        """Load API key from local config file."""
+        """Load API key from local config file (lazy — no validation on startup)."""
         try:
             if os.path.exists(CONFIG_FILE):
                 with open(CONFIG_FILE, 'r') as f:
                     config = json.load(f)
                     key = config.get('gemini_api_key', '')
                     if key:
-                        self.set_api_key(key)
+                        self._api_key = key.strip()
+                        self._model_name = "gemini-2.0-flash"
+                        self._available = True  # Assume OK; generate() handles errors
+                        print(f"[LLM] Key loaded from config (not validated yet)")
         except (json.JSONDecodeError, IOError):
             pass
 
@@ -177,13 +189,22 @@ class LLMService:
     def api_key(self) -> Optional[str]:
         return self._api_key
 
-    def set_api_key(self, key: str) -> bool:
-        """Set and validate the Gemini API key with a quick test call."""
+    def set_api_key(self, key: str) -> str:
+        """
+        Set and validate the Gemini API key with a quick test call.
+        Returns a validation code:
+          VALIDATION_OK      – connected successfully
+          VALIDATION_QUOTA   – key is valid but quota exceeded (429)
+          VALIDATION_INVALID – wrong key (401/403)
+          VALIDATION_ERROR   – network/other error
+        The key is saved for OK and QUOTA cases.
+        """
         self._api_key = key.strip()
         if not self._api_key:
             self._available = False
-            return False
+            return VALIDATION_INVALID
 
+        got_429 = False
         # Try models in order
         for model in ['gemini-2.0-flash', 'gemini-1.5-flash']:
             try:
@@ -198,21 +219,34 @@ class LLMService:
                     self._available = True
                     self._save_config()
                     print(f"[LLM] Connected to {model}")
-                    return True
+                    return VALIDATION_OK
             except urllib.error.HTTPError as e:
                 body = e.read().decode('utf-8', errors='ignore')
                 print(f"[LLM] {model} HTTP {e.code}: {body[:200]}")
-                if e.code == 400 and 'not found' in body.lower():
-                    continue  # Try next model
+                if e.code == 429:
+                    # Key is valid (Google accepted it), but quota is exhausted
+                    got_429 = True
+                    self._model_name = model
+                    continue
+                elif e.code == 400 and 'not found' in body.lower():
+                    continue  # Model not available, try next
                 elif e.code in (401, 403):
-                    break  # Bad key, don't try other models
+                    self._available = False
+                    return VALIDATION_INVALID
                 continue
             except Exception as e:
                 print(f"[LLM] {model} failed: {e}")
                 continue
 
+        # If we got 429 on at least one model, key IS valid — save it
+        if got_429:
+            self._available = True
+            self._save_config()
+            print(f"[LLM] Key saved (quota exceeded, will retry on use)")
+            return VALIDATION_QUOTA
+
         self._available = False
-        return False
+        return VALIDATION_ERROR
 
     def remove_api_key(self):
         """Remove API key and disable LLM."""
@@ -227,6 +261,7 @@ class LLMService:
         """
         Generate an empathetic response using Gemini REST API.
         Synchronous — use generate_async for UI thread safety.
+        Retries up to 3 times on 429 (quota exceeded) with exponential backoff.
         """
         if not self._available or not self._api_key:
             return LLMResponse(text="", success=False, source="template",
@@ -244,44 +279,69 @@ class LLMService:
             translated_text=translated_text,
         )
 
-        try:
-            result = _gemini_request(
-                self._api_key, self._model_name, prompt,
-                temperature=0.8, max_tokens=500, timeout=20
-            )
+        max_retries = 3
+        retry_delays = [5, 15, 30]  # seconds
 
-            # Extract text from response
-            candidates = result.get('candidates', [])
-            if not candidates:
-                # Check for prompt feedback (blocked)
-                feedback = result.get('promptFeedback', {})
-                block_reason = feedback.get('blockReason', '')
-                if block_reason:
+        for attempt in range(max_retries):
+            try:
+                result = _gemini_request(
+                    self._api_key, self._model_name, prompt,
+                    temperature=0.8, max_tokens=500, timeout=25
+                )
+
+                # Extract text from response
+                candidates = result.get('candidates', [])
+                if not candidates:
+                    feedback = result.get('promptFeedback', {})
+                    block_reason = feedback.get('blockReason', '')
+                    if block_reason:
+                        return LLMResponse(text="", success=False, source="template",
+                                           error=f"Content filtered: {block_reason}")
                     return LLMResponse(text="", success=False, source="template",
-                                       error=f"Content filtered: {block_reason}")
+                                       error="No response from Gemini")
+
+                # Get text from first candidate
+                parts = candidates[0].get('content', {}).get('parts', [])
+                text = ''.join(p.get('text', '') for p in parts).strip()
+
+                if text:
+                    return LLMResponse(text=text, success=True, source="gemini")
+                else:
+                    finish_reason = candidates[0].get('finishReason', 'UNKNOWN')
+                    return LLMResponse(text="", success=False, source="template",
+                                       error=f"Empty response (finishReason: {finish_reason})")
+
+            except urllib.error.HTTPError as e:
+                body = e.read().decode('utf-8', errors='ignore')[:300]
+                print(f"[LLM] Gemini HTTP {e.code} (attempt {attempt+1}/{max_retries}): {body[:200]}")
+
+                if e.code == 429:
+                    # Quota exceeded — wait and retry
+                    if attempt < max_retries - 1:
+                        wait = retry_delays[attempt]
+                        print(f"[LLM] Rate limited. Waiting {wait}s before retry...")
+                        time.sleep(wait)
+                        continue
+                    else:
+                        return LLMResponse(
+                            text="", success=False, source="template",
+                            error="Gemini kota aşımı (429). Birkaç dakika sonra tekrar deneyin."
+                        )
+                elif e.code in (401, 403):
+                    self._available = False
+                    return LLMResponse(text="", success=False, source="template",
+                                       error="API key geçersiz. Lütfen yeni bir key girin.")
+                else:
+                    return LLMResponse(text="", success=False, source="template",
+                                       error=f"HTTP {e.code}: {body[:100]}")
+
+            except Exception as e:
+                print(f"[LLM] Gemini error: {e}")
                 return LLMResponse(text="", success=False, source="template",
-                                   error="No response from Gemini")
+                                   error=str(e)[:100])
 
-            # Get text from first candidate
-            parts = candidates[0].get('content', {}).get('parts', [])
-            text = ''.join(p.get('text', '') for p in parts).strip()
-
-            if text:
-                return LLMResponse(text=text, success=True, source="gemini")
-            else:
-                finish_reason = candidates[0].get('finishReason', 'UNKNOWN')
-                return LLMResponse(text="", success=False, source="template",
-                                   error=f"Empty response (finishReason: {finish_reason})")
-
-        except urllib.error.HTTPError as e:
-            body = e.read().decode('utf-8', errors='ignore')[:200]
-            print(f"[LLM] Gemini HTTP {e.code}: {body}")
-            return LLMResponse(text="", success=False, source="template",
-                               error=f"HTTP {e.code}: {body[:100]}")
-        except Exception as e:
-            print(f"[LLM] Gemini error: {e}")
-            return LLMResponse(text="", success=False, source="template",
-                               error=str(e)[:100])
+        return LLMResponse(text="", success=False, source="template",
+                           error="Unexpected error after retries")
 
     def generate_async(self, category: str, confidence: float, severity: int,
                        original_text: str, translated_text: str,

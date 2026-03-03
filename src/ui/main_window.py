@@ -15,7 +15,7 @@ from ui.assistant_ui import DashboardPanel, JournalPanel
 from ui.ai_lab import AILabWidget
 from ui.breathing_widget import BreathingWidget
 from ui.about_widget import AboutWidget
-from llm_service import get_llm_service
+from llm_service import get_llm_service, VALIDATION_OK, VALIDATION_QUOTA, VALIDATION_INVALID
 
 from data_pipeline import DataPipeline
 from model_factory import ModelFactory
@@ -260,8 +260,9 @@ class MainWindow(QMainWindow):
         if self.llm_service.is_available:
             self.llm_status.setText("🟢 Gemini AI Active")
             self.llm_status.setStyleSheet(f"color: {COLORS['success']}; font-size: 11px; padding: 4px;")
-            self.status_label.setText("● AI Ready")
-            self.status_label.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px;")
+            if hasattr(self, 'status_label'):
+                self.status_label.setText("● AI Ready")
+                self.status_label.setStyleSheet(f"color: {COLORS['success']}; font-size: 12px;")
         else:
             self.llm_status.setText("⚪ Gemini AI Off")
             self.llm_status.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 11px; padding: 4px;")
@@ -357,17 +358,31 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Error", "Please enter an API key.")
             return
 
-        success = self.llm_service.set_api_key(key)
-        if success:
+        result = self.llm_service.set_api_key(key)
+        if result == VALIDATION_OK:
             self._update_llm_status()
             QMessageBox.information(self, "Success",
                                    "✅ Gemini AI connected successfully!\n"
                                    "Journal responses will now be powered by AI.")
             dialog.accept()
+        elif result == VALIDATION_QUOTA:
+            self._update_llm_status()
+            QMessageBox.information(self, "Key Saved",
+                                   "✅ API key is valid and saved!\n\n"
+                                   "⚠️ Gemini quota is currently exceeded (429).\n"
+                                   "The app will automatically retry when you write a journal entry.\n\n"
+                                   "If this persists, generate a new API key at:\n"
+                                   "https://aistudio.google.com/apikey")
+            dialog.accept()
+        elif result == VALIDATION_INVALID:
+            QMessageBox.warning(self, "Invalid Key",
+                                "❌ API key is invalid (401/403).\n"
+                                "Please check your key and try again.\n\n"
+                                "Get a free key at: https://aistudio.google.com/apikey")
         else:
-            QMessageBox.warning(self, "Failed",
+            QMessageBox.warning(self, "Connection Error",
                                 "❌ Could not connect to Gemini.\n"
-                                "Please check your API key and try again.")
+                                "Please check your internet connection and try again.")
 
     def _remove_api_key(self, dialog: QDialog):
         """Remove stored API key."""
