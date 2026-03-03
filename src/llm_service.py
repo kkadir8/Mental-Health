@@ -1,19 +1,25 @@
 """
-LLM Service — Google Gemini integration for empathetic AI responses.
+LLM Service — Google Gemini integration via direct REST API.
 
 Uses Gemini 2.0 Flash (free tier: 15 RPM, 1M tokens/day).
+No dependency on deprecated google-generativeai SDK — uses urllib directly.
 Falls back gracefully to template responses if API key is missing or quota exceeded.
 """
 
 import os
 import json
 import threading
+import urllib.request
+import urllib.error
 from typing import Optional, Callable
 from dataclasses import dataclass
 
 # Config file for storing API key locally
 CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..')
 CONFIG_FILE = os.path.join(CONFIG_DIR, '.env_config.json')
+
+# Gemini REST API endpoint
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
 
 # ---------------------------------------------------------------------------
 # System prompt — the soul of MindfulAI
@@ -86,20 +92,52 @@ class LLMResponse:
     error: Optional[str] = None
 
 
+def _gemini_request(api_key: str, model: str, prompt: str,
+                    temperature: float = 0.8, max_tokens: int = 500,
+                    timeout: int = 20) -> dict:
+    """
+    Make a direct REST API call to Gemini. No SDK needed.
+    Returns the parsed JSON response dict.
+    """
+    url = GEMINI_API_URL.format(model=model, key=api_key)
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": temperature,
+            "topP": 0.9,
+            "maxOutputTokens": max_tokens,
+        },
+        "safetySettings": [
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+        ]
+    }
+    data = json.dumps(payload).encode('utf-8')
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    resp = urllib.request.urlopen(req, timeout=timeout)
+    return json.loads(resp.read().decode('utf-8'))
+
+
 class LLMService:
     """
-    Google Gemini integration with graceful fallback.
-    
+    Google Gemini integration via REST API with graceful fallback.
+
     Usage:
         service = LLMService()
         service.set_api_key("your-key")
-        service.generate_async(prompt, callback_fn)
+        service.generate_async(category, conf, sev, text, translated, callback)
     """
 
     def __init__(self):
         self._api_key: Optional[str] = None
-        self._model = None
-        self._available = False
+        self._model_name: str = "gemini-2.0-flash"
+        self._available: bool = False
         self._load_config()
 
     # ---- Config persistence ----
@@ -140,52 +178,45 @@ class LLMService:
         return self._api_key
 
     def set_api_key(self, key: str) -> bool:
-        """Set and validate the Gemini API key."""
+        """Set and validate the Gemini API key with a quick test call."""
         self._api_key = key.strip()
-        try:
-            import google.generativeai as genai
-            genai.configure(api_key=self._api_key)
-            # Safety settings: allow mental health discussion (our app's purpose)
-            self._safety_settings = [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-            ]
-            # Try gemini-2.0-flash first, fallback to 1.5-flash
-            for model_name in ['gemini-2.0-flash', 'gemini-1.5-flash']:
-                try:
-                    self._model = genai.GenerativeModel(
-                        model_name,
-                        safety_settings=self._safety_settings
-                    )
-                    # Quick test to verify the key works
-                    self._model.generate_content(
-                        "Say OK",
-                        generation_config={'max_output_tokens': 5}
-                    )
-                    self._model_name = model_name
-                    print(f"[LLM] Connected to {model_name}")
-                    break
-                except Exception as model_err:
-                    print(f"[LLM] {model_name} failed: {model_err}")
-                    continue
-            else:
-                raise Exception("No Gemini model available")
-
-            self._available = True
-            self._save_config()
-            return True
-        except Exception as e:
-            print(f"[LLM] Failed to configure Gemini: {e}")
+        if not self._api_key:
             self._available = False
-            self._model = None
             return False
+
+        # Try models in order
+        for model in ['gemini-2.0-flash', 'gemini-1.5-flash']:
+            try:
+                result = _gemini_request(
+                    self._api_key, model, "Say OK",
+                    max_tokens=5, timeout=10
+                )
+                # Check if we got a valid response
+                candidates = result.get('candidates', [])
+                if candidates:
+                    self._model_name = model
+                    self._available = True
+                    self._save_config()
+                    print(f"[LLM] Connected to {model}")
+                    return True
+            except urllib.error.HTTPError as e:
+                body = e.read().decode('utf-8', errors='ignore')
+                print(f"[LLM] {model} HTTP {e.code}: {body[:200]}")
+                if e.code == 400 and 'not found' in body.lower():
+                    continue  # Try next model
+                elif e.code in (401, 403):
+                    break  # Bad key, don't try other models
+                continue
+            except Exception as e:
+                print(f"[LLM] {model} failed: {e}")
+                continue
+
+        self._available = False
+        return False
 
     def remove_api_key(self):
         """Remove API key and disable LLM."""
         self._api_key = None
-        self._model = None
         self._available = False
         self._save_config()
 
@@ -194,10 +225,10 @@ class LLMService:
     def generate(self, category: str, confidence: float, severity: int,
                  original_text: str, translated_text: str) -> LLMResponse:
         """
-        Generate an empathetic response using Gemini.
+        Generate an empathetic response using Gemini REST API.
         Synchronous — use generate_async for UI thread safety.
         """
-        if not self._available or not self._model:
+        if not self._available or not self._api_key:
             return LLMResponse(text="", success=False, source="template",
                                error="LLM not configured")
 
@@ -214,46 +245,43 @@ class LLMService:
         )
 
         try:
-            response = self._model.generate_content(
-                prompt,
-                generation_config={
-                    'temperature': 0.8,
-                    'top_p': 0.9,
-                    'max_output_tokens': 500,
-                },
-                safety_settings=getattr(self, '_safety_settings', None)
+            result = _gemini_request(
+                self._api_key, self._model_name, prompt,
+                temperature=0.8, max_tokens=500, timeout=20
             )
 
-            # Handle blocked responses (safety filter)
-            if hasattr(response, 'prompt_feedback'):
-                feedback = response.prompt_feedback
-                if hasattr(feedback, 'block_reason') and feedback.block_reason:
-                    return LLMResponse(
-                        text="", success=False, source="template",
-                        error=f"Content filtered ({feedback.block_reason}). Using template.")
-
-            # Check if candidates exist
-            if not response.candidates:
+            # Extract text from response
+            candidates = result.get('candidates', [])
+            if not candidates:
+                # Check for prompt feedback (blocked)
+                feedback = result.get('promptFeedback', {})
+                block_reason = feedback.get('blockReason', '')
+                if block_reason:
+                    return LLMResponse(text="", success=False, source="template",
+                                       error=f"Content filtered: {block_reason}")
                 return LLMResponse(text="", success=False, source="template",
-                                   error="No response generated (possibly filtered)")
+                                   error="No response from Gemini")
 
-            text = response.text.strip()
+            # Get text from first candidate
+            parts = candidates[0].get('content', {}).get('parts', [])
+            text = ''.join(p.get('text', '') for p in parts).strip()
+
             if text:
                 return LLMResponse(text=text, success=True, source="gemini")
             else:
+                finish_reason = candidates[0].get('finishReason', 'UNKNOWN')
                 return LLMResponse(text="", success=False, source="template",
-                                   error="Empty response from Gemini")
-        except ValueError as e:
-            # Common when response is blocked
-            error_msg = str(e)
-            print(f"[LLM] Gemini blocked: {error_msg}")
+                                   error=f"Empty response (finishReason: {finish_reason})")
+
+        except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8', errors='ignore')[:200]
+            print(f"[LLM] Gemini HTTP {e.code}: {body}")
             return LLMResponse(text="", success=False, source="template",
-                               error="Response blocked by safety filter")
+                               error=f"HTTP {e.code}: {body[:100]}")
         except Exception as e:
-            error_msg = str(e)
-            print(f"[LLM] Gemini error: {error_msg}")
+            print(f"[LLM] Gemini error: {e}")
             return LLMResponse(text="", success=False, source="template",
-                               error=error_msg)
+                               error=str(e)[:100])
 
     def generate_async(self, category: str, confidence: float, severity: int,
                        original_text: str, translated_text: str,
